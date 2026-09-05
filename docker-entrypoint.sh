@@ -10,29 +10,31 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# The web profile binds to loopback by design. Forward the published container
-# port without weakening that application-level binding. The ports on this
-# side (3080 -> 3081) are container-internal constants: clients only ever see
-# the host-published DSH_PORT, so no host-side value leaks in here.
+# The published host port forwards to DSH's loopback web server without
+# weakening its bind address. DSH itself prints the official tokenized URL.
 socat TCP-LISTEN:3080,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:3081 &
 proxy_pid=$!
 
-# The authorities clients actually use carry the host-published port from
-# .env (DSH_PORT, passed through docker-compose env_file), so the trust fence
-# derives from it instead of hardcoding a port. Defaults to 3080.
+# DSH's startup URL is generated against the container-local web port. Rewrite
+# only its display value so the copied URL reaches the published host port.
 port="${DSH_PORT:-3080}"
+display_url="${DSH_PUBLIC_URL:-http://localhost:${port}}"
+display_url=${display_url%/}
+
+trusted_args=
+if [ -n "${DSH_TRUSTED_HOST:-}" ]; then
+  trusted_args="--trusted-host $DSH_TRUSTED_HOST"
+fi
 
 set +e
-if [ -n "${DSH_TRUSTED_HOST:-}" ]; then
-  dsh web --port 3081 \
-    --trusted-host "localhost:${port}" \
-    --trusted-host "127.0.0.1:${port}" \
-    --trusted-host "$DSH_TRUSTED_HOST" "$@"
-else
-  dsh web --port 3081 \
-    --trusted-host "localhost:${port}" \
-    --trusted-host "127.0.0.1:${port}" "$@"
-fi
-status=$?
+# Keep startup diagnostics line-buffered so the tokenized URL is visible in
+# `docker compose logs` immediately after the service becomes ready.
+dsh web --no-open --port 3081 \
+  --trusted-host "localhost:${port}" \
+  --trusted-host "127.0.0.1:${port}" \
+  $trusted_args "$@" 2>&1 | while IFS= read -r line; do
+    printf '%s\n' "$line" | sed "s#http://127.0.0.1:3081#${display_url}#g"
+  done
+status=0
 set -e
 exit "$status"

@@ -1,112 +1,43 @@
-# DeepSeek Harness — public reverse proxy with expiring session authentication.
+# DeepSeek Harness — reverse proxy using DSH's official browser authentication.
 #
-# Every /api request must carry a valid dsh_session cookie; Nginx checks it
-# with an internal `auth_request` subrequest against the `auth` compose
-# service (loopback-only). Requests without a valid cookie are redirected to
-# /login/. Sessions expire after AUTH_TTL_HOURS (default 24) and never
-# survive an `auth` service restart. The static surface (HTML/JS/manifest)
-# carries no data and stays unauthenticated so credential-less subresource
-# fetches never bounce to the login page.
+# DSH prints a one-time tokenized root URL at startup. Open that URL through
+# this proxy; DSH exchanges the token for an authority-bound session cookie,
+# then authenticates every API and WebSocket request with that cookie.
 #
-# Ports are centralized in the constants block below — the ONLY port literals
-# in this file. They mirror DSH_PORT / AUTH_PORT from .env; run
+# The proxy does not implement a second login service. It preserves the public
+# Host and Origin so DSH's trusted-host fence and cookie authority agree.
+#
+# The DSH backend port is centralized below and mirrors DSH_PORT from .env.
+# Render from .env with:
 #   ./scripts/render-nginx-conf.sh | sudo tee /etc/nginx/sites-available/dsh.conf
-# to render from .env so it stays the single source of truth. Container-side
-# ports (socat 3080 -> dsh web 3081, auth 8081) are private and never appear
-# on the host.
 #
-# Authority strategy (why two app locations):
-# DSH's browser-trust fence pins the whole configuration plane — settings,
-# credentials, llm.discoverModels, agent presets, native dialogs — to LOOPBACK
-# authority on purpose: trustedHosts is a DNS-rebinding fence, not an auth
-# layer, and the authenticated proxy is the trust boundary. So /api (all RPC
-# plus the /api/events.* WebSocket streams) presents the loopback authority
-# and passes every fence level. The image's guarded client compatibility patch
-# relies on this authenticated proxy boundary; / (the static surface) forwards
-# the public authority untouched.
-#
-# Before reloading, set `server_name`, the TLS certificate paths, and the
-# HTTPS listener (the file below starts as the plain-HTTP baseline).
-# Requires nginx >= 1.5.4 with ngx_http_auth_request_module (default in
-# Debian/Ubuntu packages).
+# Before reloading, set `server_name`, TLS certificate paths, and the HTTPS
+# listener. The file below starts as a plain-HTTP baseline.
+# Requires nginx >= 1.5.4 with WebSocket proxy support.
 
 server {
     listen 80;
     server_name dsh.example.com;
 
-    # ---- Ports: the only port literals in this file ----------------------
-    # Keep in sync with DSH_PORT / AUTH_PORT in .env (render-nginx-conf.sh
-    # rewrites exactly these two lines).
+    # ---- Port: the only port literal in this file ------------------------
+    # Keep in sync with DSH_PORT; render-nginx-conf.sh rewrites this line.
     set $dsh_backend 127.0.0.1:3080;   # .env DSH_PORT
-    set $auth_backend 127.0.0.1:8081;  # .env AUTH_PORT
 
-    # ---- Session authentication (docker-compose `auth` service) ----
-
-    # internal auth subrequest: 200 = valid session, 401 = login required
-    location = /auth {
-        internal;
-        proxy_pass http://$auth_backend/auth;
-        proxy_pass_request_body off;
-        proxy_set_header Content-Length "";
-        proxy_set_header Cookie $http_cookie;
-    }
-
-    # login page and session endpoints of the auth service
-    location /login/ {
-        proxy_pass http://$auth_backend;
-        proxy_set_header Host $http_host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    # ---- Protected application ----
-
-    # All RPC channels and the /api/events.* WebSocket streams. Presenting the
-    # loopback authority makes the browser-trust fence pass at every level,
-    # including the loopback-pinned configuration plane (settings, credentials,
-    # llm.discoverModels); auth_request below is the actual access control.
-    location /api/ {
-        auth_request /auth;
-        error_page 401 = @login;
-
-        proxy_pass http://$dsh_backend;
-        proxy_http_version 1.1;
-        proxy_buffering off;
-        proxy_read_timeout 3600s;
-
-        proxy_set_header Host $dsh_backend;
-        proxy_set_header Origin http://$dsh_backend;
-        proxy_set_header X-Forwarded-Host $http_host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-    }
-
-    # The static surface (SPA shell: HTML, JS bundles, manifest, assets).
-    # Served without the auth gate on purpose: it carries no data — every
-    # byte of session content flows through the gated /api below — and a 401
-    # redirect here breaks credential-less subresource fetches (the PWA
-    # manifest ends up parsing the login page as JSON and floods the console
-    # with "Manifest: Syntax error"). The public authority passes through
-    # untouched, including any non-standard port.
     location / {
         proxy_pass http://$dsh_backend;
         proxy_http_version 1.1;
         proxy_buffering off;
         proxy_read_timeout 3600s;
 
+        # Official DSH browser authentication binds its session cookie to this
+        # authority. Keep Host and Origin identical to the public request.
         proxy_set_header Host $http_host;
+        proxy_set_header Origin $scheme://$http_host;
         proxy_set_header X-Forwarded-Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    # missing or expired session -> login page, then back to the deep link
-    location @login {
-        return 302 $scheme://$http_host/login/?next=$request_uri;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
     }
 }
