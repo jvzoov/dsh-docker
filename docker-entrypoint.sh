@@ -26,13 +26,19 @@ if [ -n "${DSH_TRUSTED_HOST:-}" ]; then
   trusted_args="--trusted-host $DSH_TRUSTED_HOST"
 fi
 
+public_url_args=
+if dsh web --help 2>&1 | grep -q -- '--public-url'; then
+  public_url_args="--public-url $display_url"
+fi
+
 set +e
 # Keep startup diagnostics line-buffered so the tokenized URL is visible in
 # `docker compose logs` immediately after the service becomes ready.
+# shellcheck disable=SC2086
 dsh web --no-open --port 3081 \
   --trusted-host "localhost:${port}" \
   --trusted-host "127.0.0.1:${port}" \
-  $trusted_args "$@" 2>&1 | while IFS= read -r line; do
+  $trusted_args $public_url_args "$@" 2>&1 | while IFS= read -r line; do
     printf '%s\n' "$line" | sed "s#http://127.0.0.1:3081#${display_url}#g"
   done
 status=0
